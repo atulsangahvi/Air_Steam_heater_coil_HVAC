@@ -1,8 +1,13 @@
-import math
+
+import hmac
 import json
+import math
+import os
+import re
 import traceback
 from datetime import datetime
-from typing import Dict, Tuple, Optional
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -14,6 +19,7 @@ except Exception:
     HAS_CP = False
 
 # ================= CONSTANTS =================
+APP_VERSION = "1.2.0-plain-cloud-multiuser"
 P_ATM = 101325.0
 R_DA = 287.055
 CP_DA = 1006.0
@@ -23,38 +29,440 @@ INCH = 0.0254
 MM = 1e-3
 GRAVITY = 9.80665
 WATER = "Water"
+REPO_ROOT = Path(__file__).resolve().parent
+CALIBRATION_FILE = REPO_ROOT / "calibration" / "calibration_data.json"
+CALIBRATION_BACKUP_DIR = REPO_ROOT / "calibration" / "backup"
+APP_SETTINGS_FILE = REPO_ROOT / "calibration" / "app_settings.json"
+EXAMPLES_DIR = REPO_ROOT / "examples"
+TEST_DATA_DIR = REPO_ROOT / "test_data"
+
+DEFAULT_APP_SETTINGS = {
+    "app_title": "Steam Air Heater Coil Designer",
+    "app_subtitle": "AHU reheat coil model for dry sensible heating after a cooling coil",
+    "saved_designs_root": "saved_designs",
+    "allow_user_json_upload": True,
+    "max_saved_designs_per_user": 200,
+}
+
+DEFAULT_CALIBRATION = {
+    "version": "1.1",
+    "created": "2026-01-01T00:00:00",
+    "air_side": {
+        "dp_correction": {
+            "multiplier": 1.0,
+            "Re_exponent": 0.0,
+            "FPI_factor": 0.0,
+            "row_factor": 0.0,
+        },
+        "h_correction": {
+            "multiplier": 1.0,
+            "near_saturation_sensitivity": 0.0,
+        },
+    },
+    "steam_side": {
+        "h_correction": {
+            "single_phase": 1.0,
+            "condensation": 1.0,
+            "subcooled_condensate": 1.0,
+        },
+        "dp_correction": {
+            "single_phase": 1.0,
+            "condensation_region": 1.0,
+            "header": 1.0,
+        },
+    },
+    "validation_stats": {
+        "r_squared": 0.0,
+        "n_tests": 0,
+        "last_calibrated": None,
+        "status": "ACTIVE - editable by admin only",
+    },
+    "calibration_notes": [
+        "Master calibration file for the steam reheat coil app.",
+        "Only admin users should change these multipliers.",
+        "Keep downloaded backups before applying measured-data tuning.",
+    ],
+}
+
+INPUT_DEFAULTS = {
+    "run_mode": "Rating: given steam flow",
+    "face_w": 1.2,
+    "face_h": 0.85,
+    "st_mm": 22.0,
+    "sl_mm": 25.4,
+    "rows": 2,
+    "do_mm": 9.53,
+    "tw_mm": 0.30,
+    "fpi": 10.0,
+    "tf_mm": 0.12,
+    "fin_mat": "Aluminum",
+    "tube_mat": "Copper",
+    "circuits": 20,
+    "sigma_free": 0.55,
+    "fin_type": "Wavy (no louvers)",
+    "louver_angle_deg": 40.0,
+    "louver_gap_mm": 2.0,
+    "louver_cuts_per_row": 8,
+    "h_mult_wavy": 1.15,
+    "dp_mult_wavy": 1.20,
+    "rfo": 0.0002,
+    "rfi": 0.0001,
+    "flow_mode": "Volume flow (m3/h)",
+    "v_face_input": 1.70,
+    "vdot_m3h": 6250.0,
+    "air_mode": "Dry Bulb + RH",
+    "t_air_in_c": 13.5,
+    "rh_air_in": 95.0,
+    "wb_air_in": 12.8,
+    "target_t_air_out_c": 18.0,
+    "pressure_basis": "bar(g)",
+    "p_steam_input": 2.0,
+    "inlet_state": "Saturated dry steam",
+    "max_subcool_k": 0.0,
+    "x_inlet": 0.98,
+    "superheat_k": 5.0,
+    "mdot_steam_kg_h": 80.0,
+    "header_length_m": 0.85,
+    "header_in_diam_in": 1.0,
+    "header_out_diam_in": 1.5,
+    "save_design_name": "",
+}
 
 
 def K(t_c: float) -> float:
     return t_c + 273.15
 
 
-# ================= PASSWORD =================
-def check_password() -> bool:
+def _deep_copy_jsonable(data: Any) -> Any:
+    return json.loads(json.dumps(data))
+
+
+def _merge_defaults(defaults: Dict[str, Any], incoming: Dict[str, Any]) -> Dict[str, Any]:
+    result = _deep_copy_jsonable(defaults)
+    for key, value in incoming.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _merge_defaults(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def ensure_repo_dirs(settings: Optional[Dict[str, Any]] = None) -> None:
+    CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CALIBRATION_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    EXAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    TEST_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    effective_settings = settings or DEFAULT_APP_SETTINGS
+    (REPO_ROOT / effective_settings.get("saved_designs_root", "saved_designs")).mkdir(parents=True, exist_ok=True)
+
+
+def load_json_file(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
+    if not path.exists():
+        return _deep_copy_jsonable(default)
     try:
-        required_password = str(st.secrets.get("APP_PASSWORD", "")).strip()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return _merge_defaults(default, data)
     except Exception:
-        required_password = ""
+        pass
+    return _deep_copy_jsonable(default)
 
-    if not required_password:
+
+def atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_calibration_data() -> Dict[str, Any]:
+    ensure_repo_dirs()
+    if not CALIBRATION_FILE.exists():
+        atomic_write_json(CALIBRATION_FILE, DEFAULT_CALIBRATION)
+    return load_json_file(CALIBRATION_FILE, DEFAULT_CALIBRATION)
+
+
+def save_calibration_data(payload: Dict[str, Any], make_backup: bool = True) -> None:
+    ensure_repo_dirs()
+    if make_backup and CALIBRATION_FILE.exists():
+        backup = CALIBRATION_BACKUP_DIR / f"calibration_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        backup.write_text(CALIBRATION_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+    atomic_write_json(CALIBRATION_FILE, payload)
+
+
+def load_app_settings() -> Dict[str, Any]:
+    ensure_repo_dirs()
+    if not APP_SETTINGS_FILE.exists():
+        atomic_write_json(APP_SETTINGS_FILE, DEFAULT_APP_SETTINGS)
+    return load_json_file(APP_SETTINGS_FILE, DEFAULT_APP_SETTINGS)
+
+
+def save_app_settings(payload: Dict[str, Any], make_backup: bool = True) -> None:
+    ensure_repo_dirs(payload)
+    if make_backup and APP_SETTINGS_FILE.exists():
+        backup = CALIBRATION_BACKUP_DIR / f"app_settings_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        backup.write_text(APP_SETTINGS_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+    atomic_write_json(APP_SETTINGS_FILE, payload)
+
+
+def saved_designs_root(settings: Dict[str, Any]) -> Path:
+    return REPO_ROOT / settings.get("saved_designs_root", "saved_designs")
+
+
+def sanitize_filename(text: str) -> str:
+    text = (text or "").strip().lower()
+    text = re.sub(r"[^a-zA-Z0-9_-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or "design"
+
+
+def user_design_dir(username: str, settings: Dict[str, Any]) -> Path:
+    path = saved_designs_root(settings) / sanitize_filename(username)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def list_design_files(username: str, settings: Dict[str, Any]) -> list[Path]:
+    path = user_design_dir(username, settings)
+    return sorted(path.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def list_example_files() -> list[Path]:
+    return sorted(EXAMPLES_DIR.glob("*.json"))
+
+
+def save_design_record(username: str, settings: Dict[str, Any], record: Dict[str, Any], design_name: str) -> Path:
+    root = user_design_dir(username, settings)
+    max_files = int(settings.get("max_saved_designs_per_user", 200))
+    existing = list_design_files(username, settings)
+    while len(existing) >= max_files and existing:
+        existing[-1].unlink(missing_ok=True)
+        existing = list_design_files(username, settings)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{stamp}_{sanitize_filename(design_name)}.json"
+    path = root / filename
+    atomic_write_json(path, record)
+    return path
+
+
+def delete_design_file(path: Path, username: str, settings: Dict[str, Any]) -> None:
+    allowed_root = user_design_dir(username, settings).resolve()
+    resolved = path.resolve()
+    if allowed_root in resolved.parents and resolved.exists() and resolved.suffix.lower() == ".json":
+        resolved.unlink()
+
+
+def verify_password(password: str, stored_value: str) -> bool:
+    """
+    Preferred secrets format for this cloud-only version:
+        [auth.users.someuser]
+        password = "MyPassword123"
+        role = "user"
+        enabled = true
+
+    Backward compatibility retained for:
+    - plain:MyPassword123
+    - legacy pbkdf2_sha256$... strings from older app versions
+    """
+    stored_value = str(stored_value or "").strip()
+    if not stored_value:
+        return False
+
+    if stored_value.startswith("plain:"):
+        stored_value = stored_value.split(":", 1)[1]
+
+    if stored_value.startswith("pbkdf2_sha256$"):
+        try:
+            import hashlib
+
+            _, iter_text, salt, hash_hex = stored_value.split("$", 3)
+            dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), int(iter_text))
+            trial = f"pbkdf2_sha256${int(iter_text)}${salt}${dk.hex()}"
+            return hmac.compare_digest(trial, stored_value)
+        except Exception:
+            return False
+
+    return hmac.compare_digest(password, stored_value)
+
+
+def load_auth_users() -> Dict[str, Dict[str, Any]]:
+    try:
+        auth_cfg = st.secrets.get("auth", {})
+        users_cfg = auth_cfg.get("users", {})
+    except Exception:
+        users_cfg = {}
+
+    parsed: Dict[str, Dict[str, Any]] = {}
+    for raw_username, raw_cfg in dict(users_cfg).items():
+        username = str(raw_username).strip()
+        if not username:
+            continue
+
+        password_value = ""
+        role = "user"
+        enabled = True
+
+        if hasattr(raw_cfg, "items"):
+            raw_dict = dict(raw_cfg)
+            if "password" in raw_dict:
+                password_value = str(raw_dict.get("password", "")).strip()
+            elif "password_hash" in raw_dict:
+                password_value = str(raw_dict.get("password_hash", "")).strip()
+            else:
+                password_value = ""
+            role = str(raw_dict.get("role", "user")).strip().lower() or "user"
+            enabled = bool(raw_dict.get("enabled", True))
+        else:
+            password_value = str(raw_cfg).strip()
+
+        parsed[username] = {
+            "password": password_value,
+            "role": role,
+            "enabled": enabled,
+        }
+    return parsed
+
+
+def logout() -> None:
+    for key in [
+        "authenticated",
+        "auth_username",
+        "auth_role",
+        "login_username",
+        "login_password",
+        "login_error",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def authenticate_user(app_title: str) -> bool:
+    users = load_auth_users()
+    if not users:
+        st.error("No user accounts found in Streamlit secrets. Add [auth.users.<username>] entries before running the app.")
+        st.stop()
+
+    if st.session_state.get("authenticated", False):
         return True
 
-    if st.session_state.get("password_correct", False):
-        return True
+    st.session_state.setdefault("login_error", "")
 
-    col1, col2, col3 = st.columns([1, 2, 1])
+    col1, col2, col3 = st.columns([1, 1.4, 1])
     with col2:
-        st.title("Steam Air Heater Coil Designer")
-        st.caption("Password protected app")
-        password = st.text_input("Enter password", type="password")
+        st.title(app_title)
+        st.caption("Multi-user cloud login required. Usernames and passwords are read from Streamlit Cloud Secrets.")
+        username = st.text_input("Username", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
         if st.button("Login", use_container_width=True):
-            if password == required_password:
-                st.session_state.password_correct = True
+            user_cfg = users.get(username)
+            if not user_cfg or not user_cfg.get("enabled", True):
+                st.session_state["login_error"] = "Unknown or disabled user account."
+            elif verify_password(password, user_cfg.get("password", "")):
+                st.session_state["authenticated"] = True
+                st.session_state["auth_username"] = username
+                st.session_state["auth_role"] = user_cfg.get("role", "user")
+                st.session_state.pop("login_password", None)
+                st.session_state["login_error"] = ""
                 st.rerun()
             else:
-                st.error("Incorrect password")
+                st.session_state["login_error"] = "Incorrect username or password."
+
+        if st.session_state.get("login_error"):
+            st.error(st.session_state["login_error"])
     return False
 
+
+def init_session_state() -> None:
+    for key, value in INPUT_DEFAULTS.items():
+        st.session_state.setdefault(key, value)
+    st.session_state.setdefault("current_summary", None)
+    st.session_state.setdefault("current_rows_csv", None)
+    st.session_state.setdefault("current_rows_df", None)
+    st.session_state.setdefault("current_design_record", None)
+    st.session_state.setdefault("selected_design_ref", "")
+    st.session_state.setdefault("uploaded_design_text", "")
+
+
+def current_input_payload() -> Dict[str, Any]:
+    payload = {key: st.session_state.get(key, default) for key, default in INPUT_DEFAULTS.items()}
+    payload["wb_air_in"] = min(float(payload["wb_air_in"]), float(payload["t_air_in_c"]))
+    payload["target_t_air_out_c"] = max(float(payload["target_t_air_out_c"]), float(payload["t_air_in_c"]))
+    if payload["flow_mode"] == "Face velocity (m/s)":
+        payload["vdot_m3h"] = float(payload["v_face_input"]) * float(payload["face_w"]) * float(payload["face_h"]) * 3600.0
+    else:
+        payload["v_face_input"] = float(payload["vdot_m3h"]) / 3600.0 / max(float(payload["face_w"]) * float(payload["face_h"]), 1e-9)
+    return payload
+
+
+def build_design_record(username: str) -> Dict[str, Any]:
+    return {
+        "meta": {
+            "owner": username,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "app": "steam_air_heater_coil",
+            "version": APP_VERSION,
+        },
+        "inputs": current_input_payload(),
+        "last_summary": st.session_state.get("current_summary"),
+    }
+
+
+def apply_input_payload(inputs: Dict[str, Any]) -> None:
+    for key in INPUT_DEFAULTS:
+        if key in inputs:
+            st.session_state[key] = inputs[key]
+    st.session_state["wb_air_in"] = min(float(st.session_state.get("wb_air_in", 0.0)), float(st.session_state.get("t_air_in_c", 0.0)))
+    st.session_state["target_t_air_out_c"] = max(float(st.session_state.get("target_t_air_out_c", 0.0)), float(st.session_state.get("t_air_in_c", 0.0)))
+
+
+def extract_inputs_from_record(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(payload.get("inputs"), dict):
+        return payload["inputs"]
+    geometry = payload.get("geometry", {}) if isinstance(payload.get("geometry"), dict) else {}
+    air_side = payload.get("air_side", {}) if isinstance(payload.get("air_side"), dict) else {}
+    steam_side = payload.get("steam_side", {}) if isinstance(payload.get("steam_side"), dict) else {}
+    advanced = payload.get("advanced", {}) if isinstance(payload.get("advanced"), dict) else {}
+    mapped = {
+        "face_w": geometry.get("face_width_m", INPUT_DEFAULTS["face_w"]),
+        "face_h": geometry.get("face_height_m", INPUT_DEFAULTS["face_h"]),
+        "rows": geometry.get("rows", INPUT_DEFAULTS["rows"]),
+        "st_mm": geometry.get("row_pitch_mm", INPUT_DEFAULTS["st_mm"]),
+        "sl_mm": geometry.get("longitudinal_pitch_mm", INPUT_DEFAULTS["sl_mm"]),
+        "do_mm": geometry.get("tube_od_mm", INPUT_DEFAULTS["do_mm"]),
+        "tw_mm": geometry.get("tube_thickness_mm", INPUT_DEFAULTS["tw_mm"]),
+        "fpi": geometry.get("fpi", INPUT_DEFAULTS["fpi"]),
+        "tf_mm": geometry.get("fin_thickness_mm", INPUT_DEFAULTS["tf_mm"]),
+        "circuits": geometry.get("circuits", INPUT_DEFAULTS["circuits"]),
+        "fin_mat": geometry.get("fin_material", INPUT_DEFAULTS["fin_mat"]),
+        "tube_mat": geometry.get("tube_material", INPUT_DEFAULTS["tube_mat"]),
+        "sigma_free": geometry.get("sigma_free_area", INPUT_DEFAULTS["sigma_free"]),
+        "flow_mode": air_side.get("flow_input_mode", INPUT_DEFAULTS["flow_mode"]),
+        "vdot_m3h": air_side.get("volume_flow_m3h", INPUT_DEFAULTS["vdot_m3h"]),
+        "v_face_input": air_side.get("face_velocity_ms", INPUT_DEFAULTS["v_face_input"]),
+        "air_mode": "Dry Bulb + RH" if "rh_in_pct" in air_side else INPUT_DEFAULTS["air_mode"],
+        "t_air_in_c": air_side.get("db_in_c", INPUT_DEFAULTS["t_air_in_c"]),
+        "rh_air_in": air_side.get("rh_in_pct", INPUT_DEFAULTS["rh_air_in"]),
+        "wb_air_in": air_side.get("wb_in_c", INPUT_DEFAULTS["wb_air_in"]),
+        "target_t_air_out_c": air_side.get("target_db_out_c", INPUT_DEFAULTS["target_t_air_out_c"]),
+        "pressure_basis": steam_side.get("pressure_basis", INPUT_DEFAULTS["pressure_basis"]),
+        "p_steam_input": steam_side.get("steam_pressure", INPUT_DEFAULTS["p_steam_input"]),
+        "inlet_state": steam_side.get("inlet_state", INPUT_DEFAULTS["inlet_state"]),
+        "x_inlet": steam_side.get("wet_steam_quality_x", INPUT_DEFAULTS["x_inlet"]),
+        "superheat_k": steam_side.get("superheat_k", INPUT_DEFAULTS["superheat_k"]),
+        "mdot_steam_kg_h": steam_side.get("steam_mass_flow_kgh", INPUT_DEFAULTS["mdot_steam_kg_h"]),
+        "max_subcool_k": steam_side.get("max_subcool_k", INPUT_DEFAULTS["max_subcool_k"]),
+        "header_in_diam_in": steam_side.get("header_inlet_diameter_in", INPUT_DEFAULTS["header_in_diam_in"]),
+        "header_out_diam_in": steam_side.get("header_outlet_diameter_in", INPUT_DEFAULTS["header_out_diam_in"]),
+        "header_length_m": steam_side.get("header_length_m", INPUT_DEFAULTS["header_length_m"]),
+        "fin_type": advanced.get("fin_type", INPUT_DEFAULTS["fin_type"]),
+        "louver_angle_deg": advanced.get("louver_angle_deg", INPUT_DEFAULTS["louver_angle_deg"]),
+        "louver_cuts_per_row": advanced.get("louver_cuts_per_row", INPUT_DEFAULTS["louver_cuts_per_row"]),
+        "louver_gap_mm": advanced.get("louver_gap_mm", INPUT_DEFAULTS["louver_gap_mm"]),
+        "h_mult_wavy": advanced.get("h_mult_wavy", INPUT_DEFAULTS["h_mult_wavy"]),
+        "dp_mult_wavy": advanced.get("dp_mult_wavy", INPUT_DEFAULTS["dp_mult_wavy"]),
+        "rfo": advanced.get("air_side_fouling", INPUT_DEFAULTS["rfo"]),
+        "rfi": advanced.get("tube_side_fouling", INPUT_DEFAULTS["rfi"]),
+    }
+    return mapped
 
 # ================= PSYCHROMETRICS =================
 def psat_water_pa(t_c: float) -> float:
@@ -468,6 +876,8 @@ def steam_state_from_hp(h: float, p_abs_pa: float) -> Dict[str, float]:
 
 
 
+
+
 def steam_row_side(
     mdot_steam_circuit: float,
     p_abs_pa: float,
@@ -475,6 +885,11 @@ def steam_row_side(
     d_i: float,
     length_row_circuit: float,
     flow_area: float,
+    h_mult_single_phase: float = 1.0,
+    h_mult_condensing: float = 1.0,
+    h_mult_subcooled: float = 1.0,
+    dp_mult_single_phase: float = 1.0,
+    dp_mult_condensing: float = 1.0,
 ) -> Dict[str, float]:
     state = steam_state_from_hp(h_bulk, p_abs_pa)
     area = max(flow_area, 1e-12)
@@ -488,11 +903,11 @@ def steam_row_side(
         x = state["x"]
         pr_red = max(p_abs_pa / max(state["Pcrit"], 1e-9), 1e-6)
         enhancer = (1.0 - x) ** 0.8 + 3.8 * (x ** 0.76) * ((1.0 - x) ** 0.04) / (pr_red ** 0.38)
-        h_i = max(1500.0, min(h_lo * max(enhancer, 1.0), 25000.0))
+        h_i = max(1500.0, min(h_lo * max(enhancer, 1.0), 25000.0)) * max(h_mult_condensing, 1e-9)
 
         dp_lo, _, _, _, _ = dp_darcy(mdot_steam_circuit, state["rho_l"], state["mu_l"], d_i, length_row_circuit)
         dp_vo, _, _, _, _ = dp_darcy(mdot_steam_circuit, state["rho_v"], state["mu_v"], d_i, length_row_circuit)
-        dp_tp = dp_muller_steinhagen(x, dp_lo, dp_vo, state["rho_l"], state["rho_v"], g, d_i)
+        dp_tp = dp_muller_steinhagen(x, dp_lo, dp_vo, state["rho_l"], state["rho_v"], g, d_i) * max(dp_mult_condensing, 1e-9)
         v_mix = g / max(state["rho"], 1e-9)
         return {
             "phase": state["phase"],
@@ -513,8 +928,11 @@ def steam_row_side(
     v = mdot_steam_circuit / max(rho * area, 1e-12)
     re = rho * v * d_i / max(mu, 1e-12)
     pr = cp * mu / max(k_fluid, 1e-12)
+    phase_h_mult = h_mult_subcooled if state["phase"] == "Subcooled condensate" else h_mult_single_phase
     h_i, _ = smooth_h_gnielinski(re, pr, d_i, k_fluid)
+    h_i *= max(phase_h_mult, 1e-9)
     dp_row, _, _, _, _ = dp_darcy(mdot_steam_circuit, rho, mu, d_i, length_row_circuit)
+    dp_row *= max(dp_mult_single_phase, 1e-9)
     return {
         "phase": state["phase"],
         "T_ref_C": state["T"] - 273.15,
@@ -532,6 +950,8 @@ def steam_row_side(
 def eps_crossflow_unmixed(nt_u: float, c_r: float) -> float:
     c_r = max(min(c_r, 0.999999), 1e-9)
     return 1.0 - math.exp((math.exp(-c_r * nt_u) - 1.0) / c_r)
+
+
 
 
 
@@ -570,11 +990,24 @@ def simulate_steam_coil(
     header_out_diam_in: float,
     header_length_m: float,
     target_t_air_out_c: Optional[float] = None,
+    calibration: Optional[Dict[str, float]] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, float], Dict[str, float]]:
     if not HAS_CP:
         raise RuntimeError("CoolProp is not installed. Add CoolProp to requirements.txt.")
     if mdot_steam_total <= 0.0:
         raise ValueError("Steam mass flow must be greater than zero.")
+
+    calibration = calibration or {}
+    air_cal = calibration.get("air_side", {})
+    steam_cal = calibration.get("steam_side", {})
+    air_h_cal = float(air_cal.get("h_correction", {}).get("multiplier", 1.0))
+    air_dp_cal = float(air_cal.get("dp_correction", {}).get("multiplier", 1.0))
+    steam_h_single = float(steam_cal.get("h_correction", {}).get("single_phase", 1.0))
+    steam_h_cond = float(steam_cal.get("h_correction", {}).get("condensation", 1.0))
+    steam_h_sub = float(steam_cal.get("h_correction", {}).get("subcooled_condensate", 1.0))
+    steam_dp_single = float(steam_cal.get("dp_correction", {}).get("single_phase", 1.0))
+    steam_dp_cond = float(steam_cal.get("dp_correction", {}).get("condensation_region", 1.0))
+    header_dp_mult = float(steam_cal.get("dp_correction", {}).get("header", 1.0))
 
     geom = geometry_areas(face_w, face_h, rows, st, do, tf, fpi, sl)
     di = max(do - 2.0 * tw, 1e-6)
@@ -589,8 +1022,11 @@ def simulate_steam_coil(
     mdot_da = mdot_air_total / (1.0 + w_air_in)
     v_face = vdot_m3_s / max(geom["face_area"], 1e-12)
 
+    eff_air_h_mult = h_mult_wavy * air_h_cal
+    eff_air_dp_mult = dp_mult_wavy * air_dp_cal
+
     h_air_row, dp_air_total, air_meta = airside_compact_htc_dp(
-        mdot_air_total=mdot_air_total,
+        mdot_air=mdot_air_total,
         face_w=face_w,
         face_h=face_h,
         full_depth=geom["depth"],
@@ -606,8 +1042,8 @@ def simulate_steam_coil(
         louver_angle_deg=louver_angle_deg,
         louver_cuts_per_row=louver_cuts_per_row,
         louver_gap_mm=louver_gap_mm,
-        h_mult_wavy=h_mult_wavy,
-        dp_mult_wavy=dp_mult_wavy,
+        h_mult_wavy=eff_air_h_mult,
+        dp_mult_wavy=eff_air_dp_mult,
     )
 
     eta_f = schmidt_fin_efficiency(geom["r_outer"], geom["r_inner"], h_air_row, fin_k, tf)
@@ -638,7 +1074,7 @@ def simulate_steam_coil(
 
     for row in range(1, rows + 1):
         h_air_local, _, _ = airside_compact_htc_dp(
-            mdot_air_total=mdot_air_total,
+            mdot_air=mdot_air_total,
             face_w=face_w,
             face_h=face_h,
             full_depth=st,
@@ -654,8 +1090,8 @@ def simulate_steam_coil(
             louver_angle_deg=louver_angle_deg,
             louver_cuts_per_row=louver_cuts_per_row,
             louver_gap_mm=louver_gap_mm,
-            h_mult_wavy=h_mult_wavy,
-            dp_mult_wavy=dp_mult_wavy,
+            h_mult_wavy=eff_air_h_mult,
+            dp_mult_wavy=eff_air_dp_mult,
         )
         eta_f_local = schmidt_fin_efficiency(geom["r_outer"], geom["r_inner"], h_air_local, fin_k, tf)
         eta_o_local = 1.0 - (geom["A_fin"] / max(geom["Ao"], 1e-12)) * (1.0 - eta_f_local)
@@ -667,6 +1103,11 @@ def simulate_steam_coil(
             d_i=di,
             length_row_circuit=l_row_circuit,
             flow_area=flow_area,
+            h_mult_single_phase=steam_h_single,
+            h_mult_condensing=steam_h_cond,
+            h_mult_subcooled=steam_h_sub,
+            dp_mult_single_phase=steam_dp_single,
+            dp_mult_condensing=steam_dp_cond,
         )
 
         u_row = uo(steam_side["h_i"], h_air_local, eta_o_local)
@@ -741,6 +1182,8 @@ def simulate_steam_coil(
     d_out_hdr = header_out_diam_in * INCH
     v_hdr_in, re_hdr_in, dp_hdr_in = header_pressure_drop(mdot_steam_total, inlet_hdr_rho, inlet_hdr_mu, d_in_hdr, header_length_m)
     v_hdr_out, re_hdr_out, dp_hdr_out = header_pressure_drop(mdot_steam_total, outlet_hdr_rho, outlet_hdr_mu, d_out_hdr, header_length_m)
+    dp_hdr_in *= max(header_dp_mult, 1e-9)
+    dp_hdr_out *= max(header_dp_mult, 1e-9)
 
     dp_steam_total = dp_steam_core + dp_hdr_in + dp_hdr_out
     t_out_c = t_air
@@ -758,8 +1201,6 @@ def simulate_steam_coil(
 
     if target_t_air_out_c is not None:
         h_air_target = h_moist_j_per_kg_da(target_t_air_out_c, w_air_in)
-        q_required = max((h_air_target - h_air_out + q_total / max(mdot_da, 1e-12)) * mdot_da, 0.0)
-        # Equivalent clearer form:
         q_required = max((h_air_target - h_moist_j_per_kg_da(t_air_in_c, w_air_in)) * mdot_da, 0.0)
     else:
         q_required = None
@@ -817,13 +1258,18 @@ def simulate_steam_coil(
         "Inlet_header_Re": re_hdr_in,
         "Outlet_header_Re": re_hdr_out,
         "Air_model": air_meta["model"],
+        "Calibration_air_h_multiplier": air_h_cal,
+        "Calibration_air_dp_multiplier": air_dp_cal,
+        "Calibration_steam_h_single_phase": steam_h_single,
+        "Calibration_steam_h_condensing": steam_h_cond,
+        "Calibration_steam_h_subcooled": steam_h_sub,
+        "Calibration_steam_dp_single_phase": steam_dp_single,
+        "Calibration_steam_dp_condensing": steam_dp_cond,
+        "Calibration_header_dp_multiplier": header_dp_mult,
     }
     if q_required is not None:
         summary["Q_required_kW"] = q_required / 1000.0
-        summary["Duty_margin_kW"] = summary["Q_total_kW"] - summary["Q_required_kW"]
-
     return df_rows, summary, geom
-
 
 
 def solve_steam_flow_for_target(**kwargs) -> Tuple[float, pd.DataFrame, Dict[str, float], Dict[str, float], bool]:
@@ -879,27 +1325,125 @@ def solve_steam_flow_for_target(**kwargs) -> Tuple[float, pd.DataFrame, Dict[str
     return high, best_df, best_summary, best_geom, True
 
 
+
 # ================= STREAMLIT UI =================
 def main() -> None:
-    st.set_page_config(page_title="Steam Air Heater Coil Designer", page_icon="Steam", layout="wide")
+    st.set_page_config(page_title="Steam Air Heater Coil Designer", page_icon="♨️", layout="wide")
+    ensure_repo_dirs()
+    init_session_state()
+    bootstrap_settings = load_app_settings()
 
-    if not check_password():
+    if not authenticate_user(bootstrap_settings.get("app_title", "Steam Air Heater Coil Designer")):
         st.stop()
 
-    st.title("Steam Air Heater Coil Designer")
-    st.caption("AHU reheat coil model for dry sensible heating after a cooling coil")
+    username = st.session_state.get("auth_username", "")
+    role = st.session_state.get("auth_role", "user").lower()
+    is_admin = role == "admin"
+    app_settings = load_app_settings()
+    calibration = load_calibration_data()
+    ensure_repo_dirs(app_settings)
+
+    st.title(app_settings.get("app_title", "Steam Air Heater Coil Designer"))
+    st.caption(app_settings.get("app_subtitle", "AHU reheat coil model for dry sensible heating after a cooling coil"))
+
+    with st.expander("Cloud Secrets format for users", expanded=False):
+        st.code(
+            """[auth.users.admin]
+password = \"AdminStrongPassword123\"
+role = \"admin\"
+enabled = true
+
+[auth.users.engineer1]
+password = \"Engineer1Password123\"
+role = \"user\"
+enabled = true
+
+[auth.users.engineer2]
+password = \"Engineer2Password123\"
+role = \"user\"
+enabled = true
+""",
+            language="toml",
+        )
+        st.caption("Paste the real TOML into Streamlit Community Cloud → App settings → Secrets. Do not store real passwords in GitHub.")
 
     with st.sidebar:
+        st.subheader("User session")
+        st.write(f"**User:** {username}")
+        st.write(f"**Role:** {role}")
+        if st.button("Logout", use_container_width=True):
+            logout()
+            st.rerun()
+
+        st.markdown("---")
         st.header("Run mode")
-        run_mode = st.radio(
+        st.radio(
             "Select calculation mode",
             ["Rating: given steam flow", "Sizing: find steam flow for target leaving DB"],
-            index=0,
+            key="run_mode",
         )
+        st.caption("Humidity ratio remains constant through the steam reheat coil in this model.")
+
         st.markdown("---")
-        st.markdown(
-            "This app keeps humidity ratio constant across the steam reheat coil, which is the usual AHU post-cooling reheat case."
-        )
+        st.header("Design library")
+        st.text_input("Design name for save", key="save_design_name", placeholder="ahu_reheat_case_01")
+        save_col, dl_col = st.columns(2)
+        with save_col:
+            if st.button("Save current", use_container_width=True):
+                record = build_design_record(username)
+                path = save_design_record(username, app_settings, record, st.session_state.get("save_design_name") or "design")
+                st.success(f"Saved {path.name}")
+        with dl_col:
+            st.download_button(
+                "Download JSON",
+                data=json.dumps(build_design_record(username), indent=2),
+                file_name=f"{sanitize_filename(username)}_current_design.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+        saved_files = list_design_files(username, app_settings)
+        example_files = list_example_files()
+        design_options: list[tuple[str, Path]] = []
+        design_options.extend([(f"Saved: {p.name}", p) for p in saved_files])
+        design_options.extend([(f"Example: {p.name}", p) for p in example_files])
+        if design_options:
+            labels = [label for label, _ in design_options]
+            selected_label = st.selectbox("Available design JSON files", labels, key="selected_design_ref")
+            selected_path = dict(design_options)[selected_label]
+            load_col, del_col = st.columns(2)
+            with load_col:
+                if st.button("Load selected", use_container_width=True):
+                    try:
+                        payload = json.loads(selected_path.read_text(encoding="utf-8"))
+                        apply_input_payload(extract_inputs_from_record(payload))
+                        st.success(f"Loaded {selected_path.name}")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not load design: {exc}")
+            with del_col:
+                can_delete = selected_label.startswith("Saved:")
+                if st.button("Delete saved", use_container_width=True, disabled=not can_delete):
+                    delete_design_file(selected_path, username, app_settings)
+                    st.success(f"Deleted {selected_path.name}")
+                    st.rerun()
+        else:
+            st.info("No saved designs yet. Save one or load an example.")
+
+        if app_settings.get("allow_user_json_upload", True):
+            uploaded_design = st.file_uploader("Upload design JSON", type=["json"])
+            if uploaded_design is not None and st.button("Load uploaded JSON", use_container_width=True):
+                try:
+                    payload = json.loads(uploaded_design.getvalue().decode("utf-8"))
+                    apply_input_payload(extract_inputs_from_record(payload))
+                    st.success("Uploaded design loaded into the session.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not load uploaded JSON: {exc}")
+
+        if is_admin:
+            st.markdown("---")
+            st.caption("Admin users can edit calibration and app settings in the Admin tab.")
 
     mat_k = {
         "Copper": 380.0,
@@ -908,141 +1452,159 @@ def main() -> None:
         "CuNi 90/10": 29.0,
     }
 
-    tab1, tab2 = st.tabs(["Inputs", "Results"])
+    tabs = st.tabs(["Inputs", "Results"] + (["Admin"] if is_admin else []))
+    tab_inputs = tabs[0]
+    tab_results = tabs[1]
+    tab_admin = tabs[2] if is_admin else None
 
-    with tab1:
+    with tab_inputs:
         st.subheader("Coil geometry")
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            face_w = st.number_input("Face width (m)", min_value=0.2, max_value=4.0, value=1.2, step=0.01)
+            st.number_input("Face width (m)", min_value=0.2, max_value=4.0, step=0.01, key="face_w")
         with c2:
-            face_h = st.number_input("Face height (m)", min_value=0.2, max_value=4.0, value=0.85, step=0.01)
+            st.number_input("Face height (m)", min_value=0.2, max_value=4.0, step=0.01, key="face_h")
         with c3:
-            st_mm = st.number_input("Row pitch St (mm)", min_value=10.0, max_value=60.0, value=22.0, step=0.01)
+            st.number_input("Row pitch St (mm)", min_value=10.0, max_value=60.0, step=0.01, key="st_mm")
         with c4:
-            sl_mm = st.number_input("Longitudinal pitch Sl (mm)", min_value=10.0, max_value=60.0, value=25.4, step=0.01)
+            st.number_input("Longitudinal pitch Sl (mm)", min_value=10.0, max_value=60.0, step=0.01, key="sl_mm")
 
         c5, c6, c7, c8 = st.columns(4)
         with c5:
-            rows = st.number_input("Number of rows", min_value=1, max_value=20, value=2, step=1)
+            st.number_input("Number of rows", min_value=1, max_value=20, step=1, key="rows")
         with c6:
-            do_mm = st.number_input("Tube OD (mm)", min_value=5.0, max_value=25.0, value=9.53, step=0.01)
+            st.number_input("Tube OD (mm)", min_value=5.0, max_value=25.0, step=0.01, key="do_mm")
         with c7:
-            tw_mm = st.number_input("Tube wall thickness (mm)", min_value=0.15, max_value=2.0, value=0.30, step=0.01)
+            st.number_input("Tube wall thickness (mm)", min_value=0.15, max_value=2.0, step=0.01, key="tw_mm")
         with c8:
-            fpi = st.number_input("FPI (1/in)", min_value=4.0, max_value=24.0, value=10.0, step=0.5)
+            st.number_input("FPI (1/in)", min_value=4.0, max_value=24.0, step=0.5, key="fpi")
 
         c9, c10, c11, c12 = st.columns(4)
         with c9:
-            tf_mm = st.number_input("Fin thickness (mm)", min_value=0.06, max_value=0.30, value=0.12, step=0.01)
+            st.number_input("Fin thickness (mm)", min_value=0.06, max_value=0.30, step=0.01, key="tf_mm")
         with c10:
-            fin_mat = st.selectbox("Fin material", ["Aluminum", "Copper", "Steel"], index=0)
+            st.selectbox("Fin material", ["Aluminum", "Copper", "Steel"], key="fin_mat")
         with c11:
-            tube_mat = st.selectbox("Tube material", ["Copper", "Aluminum", "Steel", "CuNi 90/10"], index=0)
+            st.selectbox("Tube material", ["Copper", "Aluminum", "Steel", "CuNi 90/10"], key="tube_mat")
         with c12:
-            circuits = st.number_input("Circuits", min_value=1, max_value=64, value=20, step=1)
+            st.number_input("Circuits", min_value=1, max_value=64, step=1, key="circuits")
 
-        sigma_free = st.slider("Air free-flow area ratio sigma", min_value=0.20, max_value=0.95, value=0.55, step=0.01)
+        st.slider("Air free-flow area ratio sigma", min_value=0.20, max_value=0.95, step=0.01, key="sigma_free")
 
         with st.expander("Air-side / fin options", expanded=False):
             a1, a2, a3, a4 = st.columns(4)
             with a1:
-                fin_type = st.selectbox("Fin type", ["Wavy (no louvers)", "Wavy + Louvers"], index=0)
+                st.selectbox("Fin type", ["Wavy (no louvers)", "Wavy + Louvers"], key="fin_type")
             with a2:
-                louver_angle_deg = st.number_input("Louver angle (deg)", min_value=0.0, max_value=60.0, value=40.0, step=0.1)
+                st.number_input("Louver angle (deg)", min_value=0.0, max_value=60.0, step=0.1, key="louver_angle_deg")
             with a3:
-                louver_gap_mm = st.number_input("Louver gap (mm)", min_value=0.5, max_value=5.0, value=2.0, step=0.1)
+                st.number_input("Louver gap (mm)", min_value=0.5, max_value=5.0, step=0.1, key="louver_gap_mm")
             with a4:
-                louver_cuts_per_row = st.number_input("Louvers per row", min_value=1, max_value=40, value=8, step=1)
+                st.number_input("Louvers per row", min_value=1, max_value=40, step=1, key="louver_cuts_per_row")
 
             a5, a6, a7, a8 = st.columns(4)
             with a5:
-                h_mult_wavy = st.number_input("Air h multiplier", min_value=0.5, max_value=3.0, value=1.15, step=0.01)
+                st.number_input("Air h multiplier", min_value=0.5, max_value=3.0, step=0.01, key="h_mult_wavy")
             with a6:
-                dp_mult_wavy = st.number_input("Air dp multiplier", min_value=0.5, max_value=5.0, value=1.20, step=0.01)
+                st.number_input("Air dp multiplier", min_value=0.5, max_value=5.0, step=0.01, key="dp_mult_wavy")
             with a7:
-                rfo = st.number_input("Air-side fouling (m2 K/W)", min_value=0.0, max_value=0.002, value=0.0002, step=0.00005, format="%.5f")
+                st.number_input("Air-side fouling (m2 K/W)", min_value=0.0, max_value=0.002, step=0.00005, format="%.5f", key="rfo")
             with a8:
-                rfi = st.number_input("Tube-side fouling (m2 K/W)", min_value=0.0, max_value=0.002, value=0.0001, step=0.00005, format="%.5f")
+                st.number_input("Tube-side fouling (m2 K/W)", min_value=0.0, max_value=0.002, step=0.00005, format="%.5f", key="rfi")
 
         st.subheader("Air side")
-        flow_mode = st.radio("Air flow input mode", ["Face velocity (m/s)", "Volume flow (m3/h)"], horizontal=True)
-        if flow_mode == "Face velocity (m/s)":
-            v_face_input = st.number_input("Face velocity (m/s)", min_value=0.2, max_value=6.0, value=1.7, step=0.1)
-            vdot = v_face_input * face_w * face_h
+        st.radio("Air flow input mode", ["Face velocity (m/s)", "Volume flow (m3/h)"], horizontal=True, key="flow_mode")
+        if st.session_state["flow_mode"] == "Face velocity (m/s)":
+            st.number_input("Face velocity (m/s)", min_value=0.2, max_value=6.0, step=0.1, key="v_face_input")
+            vdot = st.session_state["v_face_input"] * st.session_state["face_w"] * st.session_state["face_h"]
             vdot_m3h = vdot * 3600.0
         else:
-            vdot_m3h = st.number_input("Air volume flow (m3/h)", min_value=500.0, max_value=100000.0, value=6250.0, step=10.0)
-            vdot = vdot_m3h / 3600.0
-            v_face_input = vdot / max(face_w * face_h, 1e-9)
+            st.number_input("Air volume flow (m3/h)", min_value=500.0, max_value=100000.0, step=10.0, key="vdot_m3h")
+            vdot = st.session_state["vdot_m3h"] / 3600.0
+            vdot_m3h = st.session_state["vdot_m3h"]
+        v_face_input = vdot / max(st.session_state["face_w"] * st.session_state["face_h"], 1e-9)
         st.info(f"Face velocity = {v_face_input:.2f} m/s, volume flow = {vdot:.3f} m3/s ({vdot_m3h:.0f} m3/h)")
 
-        air_mode = st.radio("Air inlet input method", ["Dry Bulb + RH", "Dry Bulb + Wet Bulb"], horizontal=True)
+        st.radio("Air inlet input method", ["Dry Bulb + RH", "Dry Bulb + Wet Bulb"], horizontal=True, key="air_mode")
         d1, d2, d3 = st.columns(3)
         with d1:
-            t_air_in_c = st.number_input("Air inlet DB (C)", min_value=0.0, max_value=55.0, value=13.5, step=0.1)
+            st.number_input("Air inlet DB (C)", min_value=0.0, max_value=55.0, step=0.1, key="t_air_in_c")
         with d2:
-            if air_mode == "Dry Bulb + RH":
-                rh_air_in = st.number_input("Air inlet RH (%)", min_value=5.0, max_value=100.0, value=95.0, step=0.5)
-                w_air_in = w_from_t_rh(t_air_in_c, rh_air_in)
-                wb_air_in = wb_from_t_w(t_air_in_c, w_air_in)
+            if st.session_state["air_mode"] == "Dry Bulb + RH":
+                st.number_input("Air inlet RH (%)", min_value=5.0, max_value=100.0, step=0.5, key="rh_air_in")
+                w_air_in = w_from_t_rh(st.session_state["t_air_in_c"], st.session_state["rh_air_in"])
+                wb_air_in = wb_from_t_w(st.session_state["t_air_in_c"], w_air_in)
                 st.caption(f"Calculated inlet WB = {wb_air_in:.2f} C")
             else:
-                wb_air_in = st.number_input("Air inlet WB (C)", min_value=-10.0, max_value=float(t_air_in_c), value=12.8, step=0.1)
-                w_air_in = w_from_t_wb(t_air_in_c, wb_air_in)
-                rh_air_in = rh_from_t_w(t_air_in_c, w_air_in)
+                max_wb = float(st.session_state["t_air_in_c"])
+                if st.session_state["wb_air_in"] > max_wb:
+                    st.session_state["wb_air_in"] = max_wb
+                st.number_input("Air inlet WB (C)", min_value=-10.0, max_value=max_wb, step=0.1, key="wb_air_in")
+                wb_air_in = st.session_state["wb_air_in"]
+                w_air_in = w_from_t_wb(st.session_state["t_air_in_c"], wb_air_in)
+                rh_air_in = rh_from_t_w(st.session_state["t_air_in_c"], w_air_in)
                 st.caption(f"Calculated inlet RH = {rh_air_in:.2f} %")
         with d3:
-            dp_air_in = dew_point_from_t_w(t_air_in_c, w_air_in)
+            dp_air_in = dew_point_from_t_w(st.session_state["t_air_in_c"], w_air_in)
             st.metric("Air inlet dew point", f"{dp_air_in:.2f} C")
 
-        if run_mode == "Sizing: find steam flow for target leaving DB":
-            target_t_air_out_c = st.number_input("Target leaving DB after reheat (C)", min_value=t_air_in_c, max_value=60.0, value=18.0, step=0.1)
-            target_rh = rh_from_t_w(target_t_air_out_c, w_air_in)
+        if st.session_state["run_mode"] == "Sizing: find steam flow for target leaving DB":
+            st.number_input(
+                "Target leaving DB after reheat (C)",
+                min_value=float(st.session_state["t_air_in_c"]),
+                max_value=60.0,
+                step=0.1,
+                key="target_t_air_out_c",
+            )
+            target_rh = rh_from_t_w(st.session_state["target_t_air_out_c"], w_air_in)
             st.caption(f"If achieved, leaving RH will be approximately {target_rh:.1f} % at constant humidity ratio.")
         else:
-            target_t_air_out_c = st.number_input("Reference target leaving DB for comparison (C)", min_value=t_air_in_c, max_value=60.0, value=18.0, step=0.1)
+            st.number_input(
+                "Reference target leaving DB for comparison (C)",
+                min_value=float(st.session_state["t_air_in_c"]),
+                max_value=60.0,
+                step=0.1,
+                key="target_t_air_out_c",
+            )
 
         st.subheader("Steam side")
         s1, s2, s3, s4 = st.columns(4)
         with s1:
-            pressure_basis = st.selectbox("Steam pressure basis", ["bar(g)", "bar(abs)"], index=0)
+            st.selectbox("Steam pressure basis", ["bar(g)", "bar(abs)"], key="pressure_basis")
         with s2:
-            p_steam_input = st.number_input("Steam pressure", min_value=0.1, max_value=20.0, value=2.0, step=0.1)
+            st.number_input("Steam pressure", min_value=0.1, max_value=20.0, step=0.1, key="p_steam_input")
         with s3:
-            inlet_state = st.selectbox("Steam inlet state", ["Saturated dry steam", "Wet steam", "Superheated steam"], index=0)
+            st.selectbox("Steam inlet state", ["Saturated dry steam", "Wet steam", "Superheated steam"], key="inlet_state")
         with s4:
-            max_subcool_k = st.number_input("Allowable outlet condensate subcooling (K)", min_value=0.0, max_value=30.0, value=0.0, step=0.5)
+            st.number_input("Allowable outlet condensate subcooling (K)", min_value=0.0, max_value=30.0, step=0.5, key="max_subcool_k")
 
         s5, s6, s7, s8 = st.columns(4)
         with s5:
-            x_inlet = st.number_input("Wet steam inlet quality x", min_value=0.50, max_value=1.00, value=0.98, step=0.01)
+            st.number_input("Wet steam inlet quality x", min_value=0.50, max_value=1.00, step=0.01, key="x_inlet")
         with s6:
-            superheat_k = st.number_input("Steam superheat (K)", min_value=0.0, max_value=80.0, value=5.0, step=0.5)
+            st.number_input("Steam superheat (K)", min_value=0.0, max_value=80.0, step=0.5, key="superheat_k")
         with s7:
-            if run_mode == "Rating: given steam flow":
-                mdot_steam_kg_h = st.number_input("Steam mass flow (kg/h)", min_value=1.0, max_value=50000.0, value=80.0, step=1.0)
+            if st.session_state["run_mode"] == "Rating: given steam flow":
+                st.number_input("Steam mass flow (kg/h)", min_value=1.0, max_value=50000.0, step=1.0, key="mdot_steam_kg_h")
             else:
-                mdot_steam_kg_h = None
                 st.metric("Steam mass flow", "Solved by app")
         with s8:
-            header_length_m = st.number_input("Header length (m)", min_value=0.10, max_value=20.0, value=float(face_h), step=0.10)
+            st.number_input("Header length (m)", min_value=0.10, max_value=20.0, step=0.10, key="header_length_m")
 
         s9, s10 = st.columns(2)
         with s9:
-            header_in_diam_in = st.selectbox("Inlet header OD (inch)", [0.5, 0.75, 1.0, 1.25, 1.5, 2.0], index=2)
+            st.selectbox("Inlet header OD (inch)", [0.5, 0.75, 1.0, 1.25, 1.5, 2.0], key="header_in_diam_in")
         with s10:
-            header_out_diam_in = st.selectbox("Outlet header OD (inch)", [0.5, 0.75, 1.0, 1.25, 1.5, 2.0], index=4)
+            st.selectbox("Outlet header OD (inch)", [0.5, 0.75, 1.0, 1.25, 1.5, 2.0], key="header_out_diam_in")
 
-        do = do_mm * MM
-        tw = tw_mm * MM
-        tf = tf_mm * MM
-        st_pitch = st_mm * MM
-        sl_pitch = sl_mm * MM
-        fin_k = mat_k[fin_mat]
-        tube_k = mat_k[tube_mat]
-
-        p_steam_abs_pa = (p_steam_input + 1.01325) * 1e5 if pressure_basis == "bar(g)" else p_steam_input * 1e5
+        do = st.session_state["do_mm"] * MM
+        tw = st.session_state["tw_mm"] * MM
+        tf = st.session_state["tf_mm"] * MM
+        st_pitch = st.session_state["st_mm"] * MM
+        sl_pitch = st.session_state["sl_mm"] * MM
+        fin_k = mat_k[st.session_state["fin_mat"]]
+        tube_k = mat_k[st.session_state["tube_mat"]]
+        p_steam_abs_pa = (st.session_state["p_steam_input"] + 1.01325) * 1e5 if st.session_state["pressure_basis"] == "bar(g)" else st.session_state["p_steam_input"] * 1e5
 
         if HAS_CP:
             tsat_supply_c = PropsSI("T", "P", p_steam_abs_pa, "Q", 0, WATER) - 273.15
@@ -1050,62 +1612,50 @@ def main() -> None:
         else:
             st.warning("CoolProp not available in this environment, so steam saturation temperature preview is disabled.")
 
-        run = st.button("Run steam coil analysis", type="primary", use_container_width=True)
+        run_clicked = st.button("Run steam coil analysis", type="primary", use_container_width=True)
+        st.caption("Results below stay attached to your own session. Other logged-in users get separate session state.")
 
-    with tab2:
-        if not run:
-            st.info("Enter inputs and run the analysis.")
-            with st.expander("Model assumptions", expanded=True):
-                st.markdown(
-                    """
-                    1. Air is reheated sensibly only, so humidity ratio stays constant through the steam coil.
-                    2. Steam side is modeled row by row and can pass through superheated, condensing, and subcooled regions.
-                    3. The internal condensing heat transfer uses a Shah-style enhancement over liquid-only Gnielinski heat transfer.
-                    4. Air-side geometry, fin efficiency, free-area treatment, and louver options follow the same style as your DX coil app.
-                    5. Steam distribution maldistribution, control valve behavior, vacuum breakers, and trap sizing are not modeled yet.
-                    """
-                )
-            return
-
+    if run_clicked:
         try:
             common_kwargs = dict(
-                face_w=face_w,
-                face_h=face_h,
-                rows=int(rows),
+                face_w=st.session_state["face_w"],
+                face_h=st.session_state["face_h"],
+                rows=int(st.session_state["rows"]),
                 st=st_pitch,
                 sl=sl_pitch,
                 do=do,
                 tw=tw,
                 tf=tf,
-                fpi=float(fpi),
+                fpi=float(st.session_state["fpi"]),
                 fin_k=fin_k,
                 tube_k=tube_k,
-                circuits=int(circuits),
+                circuits=int(st.session_state["circuits"]),
                 vdot_m3_s=vdot,
-                t_air_in_c=t_air_in_c,
+                t_air_in_c=st.session_state["t_air_in_c"],
                 w_air_in=w_air_in,
                 p_steam_abs_pa=p_steam_abs_pa,
-                inlet_state=inlet_state,
-                x_inlet=x_inlet,
-                superheat_k=superheat_k,
-                max_subcool_k=max_subcool_k,
-                sigma_free_area=sigma_free,
-                fin_type=fin_type,
-                louver_angle_deg=louver_angle_deg,
-                louver_gap_mm=louver_gap_mm,
-                louver_cuts_per_row=int(louver_cuts_per_row),
-                h_mult_wavy=h_mult_wavy,
-                dp_mult_wavy=dp_mult_wavy,
-                rfo=rfo,
-                rfi=rfi,
-                header_in_diam_in=header_in_diam_in,
-                header_out_diam_in=header_out_diam_in,
-                header_length_m=header_length_m,
-                target_t_air_out_c=target_t_air_out_c,
+                inlet_state=st.session_state["inlet_state"],
+                x_inlet=st.session_state["x_inlet"],
+                superheat_k=st.session_state["superheat_k"],
+                max_subcool_k=st.session_state["max_subcool_k"],
+                sigma_free_area=st.session_state["sigma_free"],
+                fin_type=st.session_state["fin_type"],
+                louver_angle_deg=st.session_state["louver_angle_deg"],
+                louver_gap_mm=st.session_state["louver_gap_mm"],
+                louver_cuts_per_row=int(st.session_state["louver_cuts_per_row"]),
+                h_mult_wavy=st.session_state["h_mult_wavy"],
+                dp_mult_wavy=st.session_state["dp_mult_wavy"],
+                rfo=st.session_state["rfo"],
+                rfi=st.session_state["rfi"],
+                header_in_diam_in=st.session_state["header_in_diam_in"],
+                header_out_diam_in=st.session_state["header_out_diam_in"],
+                header_length_m=st.session_state["header_length_m"],
+                target_t_air_out_c=st.session_state["target_t_air_out_c"],
+                calibration=calibration,
             )
 
-            if run_mode == "Rating: given steam flow":
-                df_rows, summary, geom = simulate_steam_coil(mdot_steam_total=mdot_steam_kg_h / 3600.0, **common_kwargs)
+            if st.session_state["run_mode"] == "Rating: given steam flow":
+                df_rows, summary, geom = simulate_steam_coil(mdot_steam_total=st.session_state["mdot_steam_kg_h"] / 3600.0, **common_kwargs)
                 solved_mdot_kg_h = summary["Steam_mdot_kg_h"]
                 solved = True
             else:
@@ -1114,7 +1664,41 @@ def main() -> None:
                 summary["Steam_mdot_kg_s"] = solved_mdot_kg_s
                 summary["Steam_mdot_kg_h"] = solved_mdot_kg_h
 
+            st.session_state["current_summary"] = summary
+            st.session_state["current_rows_df"] = df_rows
+            st.session_state["current_rows_csv"] = df_rows.to_csv(index=False).encode("utf-8")
+            st.session_state["current_design_record"] = build_design_record(username)
+            st.session_state["current_design_record"]["last_summary"] = summary
+            st.session_state["current_solved"] = solved
             st.success("Analysis complete")
+        except Exception as exc:
+            st.session_state["current_summary"] = None
+            st.session_state["current_rows_df"] = None
+            st.session_state["current_rows_csv"] = None
+            st.error(f"Simulation error: {exc}")
+            st.code(traceback.format_exc())
+
+    with tab_results:
+        summary = st.session_state.get("current_summary")
+        df_rows = st.session_state.get("current_rows_df")
+        csv_data = st.session_state.get("current_rows_csv")
+        if not summary or df_rows is None:
+            st.info("Enter inputs and run the analysis. Results shown here belong only to your current user session.")
+            with st.expander("Model assumptions", expanded=True):
+                st.markdown(
+                    """
+                    1. Air is reheated sensibly only, so humidity ratio stays constant through the steam coil.
+                    2. Steam side is modeled row by row and can pass through superheated, condensing, and subcooled regions.
+                    3. The internal condensing heat transfer uses a Shah-style enhancement over liquid-only Gnielinski heat transfer.
+                    4. Air-side geometry, fin efficiency, free-area treatment, and louver options follow the same style as your DX coil app.
+                    5. Master calibration multipliers are read from `calibration/calibration_data.json` and only admin can edit them.
+                    6. Per-user saved designs are written under the saved-designs root defined in app settings.
+                    """
+                )
+        else:
+            solved_mdot_kg_h = summary.get("Steam_mdot_kg_h", 0.0)
+            target_t_air_out_c = st.session_state.get("target_t_air_out_c")
+            solved = bool(st.session_state.get("current_solved", True))
 
             m1, m2, m3, m4 = st.columns(4)
             with m1:
@@ -1139,19 +1723,14 @@ def main() -> None:
             with m7:
                 st.metric("Rows available", f"{summary['Rows_available']}")
             with m8:
-                if summary["Rows_needed_to_target"] is None:
-                    txt = "Not reached" if target_t_air_out_c is not None else "-"
-                else:
-                    txt = str(summary["Rows_needed_to_target"])
+                txt = "Not reached" if summary["Rows_needed_to_target"] is None else str(summary["Rows_needed_to_target"])
                 st.metric("Rows to target", txt)
 
-            if run_mode == "Sizing: find steam flow for target leaving DB":
+            if st.session_state["run_mode"] == "Sizing: find steam flow for target leaving DB":
                 if solved:
                     st.success(f"Target leaving DB of {target_t_air_out_c:.2f} C can be met. Required steam flow is about {solved_mdot_kg_h:.1f} kg/h.")
                 else:
-                    st.warning(
-                        f"Even at high steam flow, the coil did not reach the target leaving DB of {target_t_air_out_c:.2f} C. This suggests the present coil face area / rows / fin geometry is UA-limited."
-                    )
+                    st.warning(f"Even at high steam flow, the coil did not reach the target leaving DB of {target_t_air_out_c:.2f} C. The current coil appears UA-limited.")
             else:
                 if summary["Air_out_DB_C"] >= target_t_air_out_c - 1e-6:
                     st.success(f"Reference target leaving DB of {target_t_air_out_c:.2f} C is achieved in rating mode.")
@@ -1192,30 +1771,100 @@ def main() -> None:
             with g4:
                 st.metric("Amin", f"{summary['Amin_m2']:.4f} m2")
 
+            st.subheader("Calibration applied in this run")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                st.metric("Air h cal", f"{summary['Calibration_air_h_multiplier']:.3f}")
+            with c2:
+                st.metric("Air dp cal", f"{summary['Calibration_air_dp_multiplier']:.3f}")
+            with c3:
+                st.metric("Steam h condensing", f"{summary['Calibration_steam_h_condensing']:.3f}")
+            with c4:
+                st.metric("Header dp cal", f"{summary['Calibration_header_dp_multiplier']:.3f}")
+
             st.subheader("Row-by-row results")
             st.dataframe(df_rows.round(4), use_container_width=True, height=420)
 
             st.subheader("Downloads")
-            csv_data = df_rows.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "Download row results CSV",
                 data=csv_data,
-                file_name=f"steam_coil_rows_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                file_name=f"{sanitize_filename(username)}_steam_coil_rows_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv",
                 use_container_width=True,
             )
-            summary_json = json.dumps(summary, indent=2)
             st.download_button(
                 "Download summary JSON",
-                data=summary_json,
-                file_name=f"steam_coil_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                data=json.dumps(summary, indent=2),
+                file_name=f"{sanitize_filename(username)}_steam_coil_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
                 mime="application/json",
                 use_container_width=True,
             )
 
-        except Exception as exc:
-            st.error(f"Simulation error: {exc}")
-            st.code(traceback.format_exc())
+    if is_admin and tab_admin is not None:
+        with tab_admin:
+            st.subheader("Admin controls")
+            st.info("User accounts are managed in Streamlit Cloud Secrets. This page controls only master calibration and app settings.")
+            cal_tab, set_tab = st.tabs(["Calibration", "Settings"])
+            with cal_tab:
+                st.markdown("### Master calibration multipliers")
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    air_h_cal = st.number_input("Air h multiplier", min_value=0.5, max_value=2.0, value=float(calibration['air_side']['h_correction']['multiplier']), step=0.01)
+                    air_dp_cal = st.number_input("Air dp multiplier", min_value=0.5, max_value=3.0, value=float(calibration['air_side']['dp_correction']['multiplier']), step=0.01)
+                with c2:
+                    steam_h_single = st.number_input("Steam h single phase", min_value=0.5, max_value=2.0, value=float(calibration['steam_side']['h_correction']['single_phase']), step=0.01)
+                    steam_h_cond = st.number_input("Steam h condensing", min_value=0.5, max_value=2.0, value=float(calibration['steam_side']['h_correction']['condensation']), step=0.01)
+                    steam_h_sub = st.number_input("Steam h subcooled", min_value=0.5, max_value=2.0, value=float(calibration['steam_side']['h_correction']['subcooled_condensate']), step=0.01)
+                with c3:
+                    steam_dp_single = st.number_input("Steam dp single phase", min_value=0.5, max_value=3.0, value=float(calibration['steam_side']['dp_correction']['single_phase']), step=0.01)
+                    steam_dp_cond = st.number_input("Steam dp condensing", min_value=0.5, max_value=3.0, value=float(calibration['steam_side']['dp_correction']['condensation_region']), step=0.01)
+                    steam_dp_header = st.number_input("Header dp multiplier", min_value=0.5, max_value=3.0, value=float(calibration['steam_side']['dp_correction']['header']), step=0.01)
+                cal_notes = st.text_area("Calibration notes", value="\n".join(calibration.get('calibration_notes', [])), height=120)
+                if st.button("Save calibration", type="primary"):
+                    calibration['air_side']['h_correction']['multiplier'] = air_h_cal
+                    calibration['air_side']['dp_correction']['multiplier'] = air_dp_cal
+                    calibration['steam_side']['h_correction']['single_phase'] = steam_h_single
+                    calibration['steam_side']['h_correction']['condensation'] = steam_h_cond
+                    calibration['steam_side']['h_correction']['subcooled_condensate'] = steam_h_sub
+                    calibration['steam_side']['dp_correction']['single_phase'] = steam_dp_single
+                    calibration['steam_side']['dp_correction']['condensation_region'] = steam_dp_cond
+                    calibration['steam_side']['dp_correction']['header'] = steam_dp_header
+                    calibration['validation_stats']['last_calibrated'] = datetime.now().isoformat(timespec='seconds')
+                    calibration['calibration_notes'] = [line for line in cal_notes.splitlines() if line.strip()]
+                    save_calibration_data(calibration, make_backup=True)
+                    st.success("Calibration saved. A backup copy was written to calibration/backup.")
+                    st.rerun()
+                st.download_button(
+                    "Download calibration JSON",
+                    data=json.dumps(calibration, indent=2),
+                    file_name=f"steam_coil_calibration_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json",
+                )
+            with set_tab:
+                st.markdown("### App settings")
+                app_title = st.text_input("App title", value=app_settings.get('app_title', DEFAULT_APP_SETTINGS['app_title']))
+                app_subtitle = st.text_input("App subtitle", value=app_settings.get('app_subtitle', DEFAULT_APP_SETTINGS['app_subtitle']))
+                saved_root = st.text_input("Saved designs root folder", value=app_settings.get('saved_designs_root', DEFAULT_APP_SETTINGS['saved_designs_root']))
+                allow_upload = st.checkbox("Allow users to upload design JSON", value=bool(app_settings.get('allow_user_json_upload', True)))
+                max_saved = st.number_input("Max saved designs per user", min_value=5, max_value=1000, value=int(app_settings.get('max_saved_designs_per_user', 200)), step=5)
+                if st.button("Save app settings"):
+                    new_settings = {
+                        'app_title': app_title,
+                        'app_subtitle': app_subtitle,
+                        'saved_designs_root': sanitize_filename(saved_root) or 'saved_designs',
+                        'allow_user_json_upload': bool(allow_upload),
+                        'max_saved_designs_per_user': int(max_saved),
+                    }
+                    save_app_settings(new_settings, make_backup=True)
+                    st.success("App settings saved. A backup copy was written to calibration/backup.")
+                    st.rerun()
+                st.download_button(
+                    "Download app settings JSON",
+                    data=json.dumps(app_settings, indent=2),
+                    file_name=f"steam_coil_app_settings_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json",
+                )
 
 
 if __name__ == "__main__":
