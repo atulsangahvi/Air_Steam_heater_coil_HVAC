@@ -1,0 +1,74 @@
+{
+  "test_id": "TEST_001",
+  "test_type": "Steam Reheat Coil Performance",
+  "timestamp": "2026-01-01T10:00:00",
+  "tester": "Operator Name",
+  "coil_config": {
+    "face_width_m": 1.2,
+    "face_height_m": 0.85,
+    "rows": 2,
+    "tube_od_mm": 9.53,
+    "tube_thickness_mm": 0.30,
+    "fpi": 10,
+    "fin_thickness_mm": 0.12,
+    "circuits": 20,
+    "fin_material": "Aluminum",
+    "tube_material": "Copper"
+  },
+  "test_conditions": {
+    "air_side": {
+      "flow_rate_m3h": 6250,
+      "face_velocity_ms": 1.70,
+      "db_in_c": 13.5,
+      "rh_in_pct": 95.0,
+      "wb_in_c": 12.8,
+      "db_out_c": 18.0,
+      "rh_out_pct": 70.0,
+      "wb_out_c": 14.8
+    },
+    "steam_side": {
+      "pressure_basis": "bar(g)",
+      "pressure": 2.0,
+      "inlet_state": "Saturated dry steam",
+      "inlet_quality": 1.0,
+      "superheat_k": 0.0,
+      "mass_flow_kgh": 80.0,
+      "inlet_pressure_kpa_abs": 301.3,
+      "outlet_pressure_kpa_abs": 296.0,
+      "pressure_drop_kpa": 5.3
+    }
+  },
+  "measured_results": {
+    "heating_capacity_kw": 8.6,
+    "air_pressure_drop_pa": 32.0,
+    "steam_pressure_drop_kpa": 5.3,
+    "air_out_db_c": 18.0,
+    "air_out_wb_c": 14.8,
+    "air_out_rh_pct": 70.0,
+    "condensate_rate_kgh": 13.4
+  },
+  "predicted_results": {
+    "heating_capacity_kw": 8.3,
+    "air_pressure_drop_pa": 30.5,
+    "steam_pressure_drop_kpa": 5.8,
+    "air_out_db_c": 17.8,
+    "air_out_wb_c": 14.7,
+    "air_out_rh_pct": 71.2,
+    "condensate_rate_kgh": 13.0
+  },
+  "uncertainty": {
+    "temperature_c": 0.1,
+    "pressure_kpa": 0.5,
+    "flow_rate_pct": 1.5,
+    "humidity_pct": 1.0,
+    "power_w": 50
+  },
+  "calibration_adjustments": {
+    "air_dp_multiplier": 1.05,
+    "air_h_multiplier": 0.98,
+    "steam_h_single_phase_multiplier": 1.00,
+    "steam_h_condensation_multiplier": 0.95,
+    "steam_dp_multiplier": 1.08
+  },
+  "notes": "Template for comparing measured steam reheat coil data with model predictions under stable AHU operating conditions."
+}
