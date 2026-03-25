@@ -71,3 +71,9 @@ calibration/backup/*.json
 
 # Local test results
 test_results/
+
+# User-saved designs
+saved_designs/
+
+# Local streamlit secrets examples are safe, real secrets are not
+!.streamlit/secrets.toml.example
