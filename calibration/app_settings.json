@@ -1,0 +1,7 @@
+{
+  "app_title": "Steam Air Heater Coil Designer",
+  "app_subtitle": "AHU reheat coil model for dry sensible heating after a cooling coil",
+  "saved_designs_root": "saved_designs",
+  "allow_user_json_upload": true,
+  "max_saved_designs_per_user": 200
+}
