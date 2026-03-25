@@ -1,0 +1,73 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+.eggs/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache/
+
+# IDE / editor
+.idea/
+.vscode/
+*.code-workspace
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Temp / logs
+*.log
+logs/
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Streamlit secrets (DO NOT COMMIT)
+.secrets.toml
+secrets.toml
+.streamlit/secrets.toml
+
+# Generated reports / outputs
+*.pdf
+*.xlsx
+*.xls
+steam_coil_rows_*.csv
+steam_coil_summary_*.json
+
+# Local calibration backups
+calibration/backup/*.json
+
+# Local test results
+test_results/
