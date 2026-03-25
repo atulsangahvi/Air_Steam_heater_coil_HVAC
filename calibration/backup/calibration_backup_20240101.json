@@ -1,0 +1,40 @@
+{
+  "version": "1.0",
+  "created": "2026-01-01T00:00:00",
+  "description": "Initial backup - Default steam reheat coil calibration values",
+  "air_side": {
+    "dp_correction": {
+      "multiplier": 1.0,
+      "Re_exponent": 0.0,
+      "FPI_factor": 0.0,
+      "row_factor": 0.0
+    },
+    "h_correction": {
+      "multiplier": 1.0,
+      "near_saturation_sensitivity": 0.0
+    }
+  },
+  "steam_side": {
+    "h_correction": {
+      "single_phase": 1.0,
+      "condensation": 1.0,
+      "subcooled_condensate": 1.0
+    },
+    "dp_correction": {
+      "single_phase": 1.0,
+      "condensation_region": 1.0,
+      "header": 1.0
+    }
+  },
+  "validation_stats": {
+    "r_squared": 0.0,
+    "n_tests": 0,
+    "last_calibrated": null,
+    "status": "DEFAULT - No calibration applied"
+  },
+  "notes": [
+    "Initial backup for the steam reheat coil calibration file.",
+    "Keep a copy before making calibration changes.",
+    "Record the test conditions that justify each change."
+  ]
+}
