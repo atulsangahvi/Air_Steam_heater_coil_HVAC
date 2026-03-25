@@ -1,146 +1,103 @@
-# User Guide
+# User Guide - Steam Air Heater Coil Designer
 
-## Getting Started
+## 1. Purpose
 
-### Installation
-1. Install Python 3.8+
-2. Install required packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Run the app:
-   ```bash
-   streamlit run steam_air_heater_coil_app.py
-   ```
+This app models a steam reheat coil installed after a cooling coil in an AHU. Air entering the reheat coil can be close to saturation. The app reheats that air sensibly, so humidity ratio remains constant while dry bulb rises and relative humidity falls.
 
-## App purpose
-This app is for **steam air heater coils used for AHU reheat** after a cooling coil. The entering air may be near 100% RH, but the steam coil is treated as a **dry sensible heating coil**. Therefore:
-- humidity ratio is held constant across the steam coil
-- dry bulb increases
-- wet bulb increases modestly
-- dew point stays essentially unchanged
-- relative humidity decreases
+## 2. User roles
 
-## Workflow
+### Standard user
+- log in with assigned username and password
+- enter geometry and operating conditions
+- run rating or sizing calculations
+- save and reload their own design JSON files
+- download summary and row-by-row results
 
-### 1. Choose the run mode
-- **Rating: given steam flow**
-- **Sizing: find steam flow for target leaving DB**
+### Admin user
+- everything a standard user can do
+- edit master calibration multipliers
+- edit app settings
+- download calibration and settings JSON backups
 
-### 2. Enter coil geometry
-Use the same style of geometry used in the DX evaporator project:
-- face width
-- face height
-- row pitch St
-- longitudinal pitch Sl
-- number of rows
-- tube OD
-- tube wall thickness
-- fins per inch
-- fin thickness
-- fin material
-- tube material
+## 3. Login setup
+
+Create users in Streamlit secrets. Streamlit reads secrets from `.streamlit/secrets.toml` locally or from the Cloud secrets manager when deployed.
+
+Recommended steps:
+1. run `python generate_password_hash.py "YourPassword"`
+2. copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`
+3. paste the generated hashes for each user
+4. set `role = "admin"` only for administrators
+
+## 4. Running the app
+
+```bash
+pip install -r requirements.txt
+streamlit run steam_air_heater_coil_app.py
+```
+
+## 5. Inputs
+
+### Coil geometry
+- face width and face height
+- row pitch and longitudinal pitch
+- rows
+- tube OD and wall thickness
+- FPI and fin thickness
+- fin and tube material
 - circuits
-- sigma free area
-
-### 3. Enter air-side data
-Choose air flow as either:
-- face velocity, or
-- volume flow
-
-Choose air inlet condition as either:
-- dry bulb + RH, or
-- dry bulb + wet bulb
-
-The app calculates the remaining psychrometric properties automatically.
-
-### 4. Enter steam-side data
-- pressure basis: bar(g) or bar(abs)
-- steam pressure
-- inlet state
-- wet steam inlet quality if applicable
-- superheat if applicable
-- allowable condensate subcooling
-- steam mass flow in rating mode
-- target leaving DB in sizing mode
-- header diameters and header length
-
-### 5. Run the analysis
-The app reports:
-- total duty
-- leaving air DB / WB / RH / dew point
-- steam flow
-- condensate rate
-- air-side pressure drop
-- steam-side pressure drop
-- rows needed to hit target leaving temperature
-- row-by-row table
-
-## Understanding the results
+- sigma free-flow area ratio
 
 ### Air side
-The most important check in reheat service is that the coil lifts the air to the required leaving dry bulb while keeping humidity ratio unchanged.
+- face velocity or volume flow
+- inlet dry bulb + RH, or inlet dry bulb + wet bulb
+- target leaving DB for sizing mode, or reference target for rating mode
 
-### Relative humidity reduction
-The app shows RH reduction directly. This is usually the main process purpose in AHU reheat service.
+### Steam side
+- steam pressure in bar(g) or bar(abs)
+- inlet state: saturated dry, wet steam, or superheated
+- wet steam quality
+- superheat
+- condensate subcooling allowance
+- header diameters and header length
+- steam mass flow in rating mode
 
-### Rows to target
-This indicates whether the selected row count is enough. If the target is not reached even with high steam flow, the coil is likely **UA-limited** rather than steam-flow-limited.
+## 6. Saved designs
 
-### Condensate outlet phase
-The outlet may remain:
-- still wet / partly condensing,
-- fully condensed at saturation, or
-- slightly subcooled if allowed.
+The sidebar lets each user:
+- save the current inputs into their own saved-design folder
+- load one of their own saved designs
+- load a shared example file from the repo
+- upload a JSON design and load it into the session
+- delete one of their own saved designs
 
-## Recommended first checks
-For a new design, review these first:
-1. Leaving air DB
-2. Leaving air RH
-3. Total duty
-4. Air pressure drop
-5. Steam flow required
-6. Rows to target
-7. Steam outlet phase
+Each browser session keeps its own state, so multiple logged-in users can work on different cases simultaneously without sharing on-screen widget values.
 
-## Typical input guidance
+## 7. Results
 
-### Entering air after cooling coil
-Typical reheat entering conditions may be around:
-- 11 to 15 C DB
-- 90 to 100% RH
+The Results tab shows:
+- total duty
+- leaving air DB, WB, RH, and dew point
+- steam flow and condensate rate
+- steam-side and air-side pressure drops
+- rows needed to meet target
+- row-by-row data table
+- calibration factors applied during the run
 
-### Steam pressure
-Many AHU reheat coils use low-pressure steam. Start with the actual available steam pressure at the coil inlet rather than boiler pressure.
+## 8. Admin tab
 
-### Wet steam quality
-If steam quality is uncertain, start with:
-- 1.00 for dry saturated supply
-- 0.97 to 0.99 if some moisture carryover is expected
+### Calibration
+Use this page to tune the model against measured or vendor data. Save writes the master calibration JSON and creates a backup.
 
-### Allowed subcooling
-Start with 0 K unless there is a clear reason to model subcooled condensate inside the coil.
+### Settings
+Use this page to change the visible app title/subtitle and the save-folder behavior.
 
-## Limitations
-- no valve authority calculation
-- no control valve Cv sizing
-- no trap sizing or stall analysis
-- no detailed condensate backing-up analysis
-- no steam distribution maldistribution model
-- no casing heat loss
-- no air bypass fraction model
+## 9. Recommended workflow
 
-## Calibration files
-The repository includes calibration placeholders so you can later tune:
-- air-side pressure drop multiplier
-- air-side heat-transfer multiplier
-- steam-side single-phase heat-transfer multiplier
-- steam-side condensation multiplier
-- steam-side pressure-drop multiplier
-
-## Downloads
-The app exports:
-- row-by-row CSV
-- summary JSON
-
-These outputs are useful for keeping design records and building your own calibration database.
+1. log in
+2. load an example or enter geometry manually
+3. run a baseline calculation
+4. save the design under a meaningful name
+5. compare with vendor or test data
+6. if you are admin, tune calibration multipliers and rerun
+7. export the summary JSON and row table CSV
