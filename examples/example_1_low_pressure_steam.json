@@ -1,0 +1,57 @@
+{
+  "name": "AHU Steam Reheat Coil - Low Pressure Steam",
+  "description": "Typical AHU reheat coil after a DX cooling coil with nearly saturated entering air.",
+  "geometry": {
+    "face_width_m": 1.2,
+    "face_height_m": 0.85,
+    "rows": 2,
+    "row_pitch_mm": 22.0,
+    "longitudinal_pitch_mm": 25.4,
+    "tube_od_mm": 9.53,
+    "tube_thickness_mm": 0.30,
+    "fpi": 10.0,
+    "fin_thickness_mm": 0.12,
+    "circuits": 20,
+    "fin_material": "Aluminum",
+    "tube_material": "Copper",
+    "sigma_free_area": 0.55
+  },
+  "air_side": {
+    "flow_input_mode": "Volume flow (m3/h)",
+    "volume_flow_m3h": 6250.0,
+    "face_velocity_ms": 1.70,
+    "input_mode": "Dry Bulb + Relative Humidity",
+    "db_in_c": 13.5,
+    "rh_in_pct": 95.0,
+    "wb_in_c": 12.8,
+    "target_db_out_c": 18.0
+  },
+  "steam_side": {
+    "pressure_basis": "bar(g)",
+    "steam_pressure": 2.0,
+    "inlet_state": "Saturated dry steam",
+    "wet_steam_quality_x": 1.0,
+    "superheat_k": 0.0,
+    "steam_mass_flow_kgh": 80.0,
+    "max_subcool_k": 0.0,
+    "header_inlet_diameter_in": 1.0,
+    "header_outlet_diameter_in": 1.5,
+    "header_length_m": 0.85
+  },
+  "advanced": {
+    "fin_type": "Wavy + Louvers",
+    "louver_angle_deg": 40.0,
+    "louver_cuts_per_row": 8,
+    "louver_gap_mm": 2.0,
+    "h_mult_wavy": 1.15,
+    "dp_mult_wavy": 1.20,
+    "air_side_fouling": 0.0002,
+    "tube_side_fouling": 0.0001
+  },
+  "expected_results": {
+    "leaving_air_db_c": 18.0,
+    "relative_humidity_should_drop": true,
+    "humidity_ratio_constant": true
+  },
+  "notes": "Use as a starting point for AHU reheat duty where air enters the steam coil almost saturated after the cooling coil."
+}
